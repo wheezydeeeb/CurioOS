@@ -1,17 +1,19 @@
+# Core dependencies
 langgraph>=0.2.0
+langchain-groq>=0.2.0
+langchain-core>=0.2.0
 groq>=0.9.0
 pydantic>=2.8.0
 python-dotenv>=1.0.1
-watchdog>=4.0.1
-tqdm>=4.66.4
+
+# Embedding and vector search (CPU-only)
 sentence-transformers>=3.0.1
 scikit-learn>=1.5.1
 numpy>=2.1.1
 scipy>=1.13.1
+
+# Document processing
 pdfminer.six>=20231228
-pynput>=1.7.7
-langchain-core>=0.2.0
-torch>=2.3.0
-langchain-groq>=0.2.0
+watchdog>=4.0.1
 
 
