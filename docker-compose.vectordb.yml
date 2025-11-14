@@ -1,0 +1,234 @@
+# Docker Compose configuration for vector databases
+# Use this file to easily spin up different vector database options for CurioOS
+
+version: '3.8'
+
+services:
+  # ============================================================================
+  # Qdrant - Production-grade vector database (RECOMMENDED)
+  # ============================================================================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: curioos-qdrant
+    ports:
+      - "6333:6333"  # REST API
+      - "6334:6334"  # gRPC API
+    volumes:
+      - ./data/qdrant_storage:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__LOG_LEVEL=INFO
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:6333/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - curioos-network
+
+  # Dashboard accessible at: http://localhost:6333/dashboard
+
+  # ============================================================================
+  # Weaviate - For hybrid search (vector + BM25 keyword)
+  # ============================================================================
+  weaviate:
+    image: semitechnologies/weaviate:latest
+    container_name: curioos-weaviate
+    ports:
+      - "8080:8080"  # HTTP API
+    volumes:
+      - ./data/weaviate_data:/var/lib/weaviate
+    environment:
+      # Enable anonymous access for local development
+      - AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true
+      # Persistence
+      - PERSISTENCE_DATA_PATH=/var/lib/weaviate
+      # Query defaults
+      - QUERY_DEFAULTS_LIMIT=25
+      # Enable various modules (optional)
+      - ENABLE_MODULES=text2vec-transformers
+      # Resource limits
+      - LIMIT_RESOURCES=true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - curioos-network
+
+  # ============================================================================
+  # Milvus - For large-scale deployments (billions of vectors)
+  # Note: Milvus requires etcd and MinIO, making it heavier
+  # ============================================================================
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: curioos-milvus-etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ./data/milvus/etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    networks:
+      - curioos-network
+    profiles:
+      - milvus
+
+  minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: curioos-milvus-minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - ./data/milvus/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - curioos-network
+    profiles:
+      - milvus
+
+  milvus:
+    image: milvusdb/milvus:v2.3.3
+    container_name: curioos-milvus
+    depends_on:
+      - etcd
+      - minio
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - ./data/milvus/milvus:/var/lib/milvus
+    ports:
+      - "19530:19530"  # gRPC
+      - "9091:9091"    # Metrics
+    command: ["milvus", "run", "standalone"]
+    networks:
+      - curioos-network
+    profiles:
+      - milvus
+
+  # ============================================================================
+  # PostgreSQL with pgvector - For hybrid relational + vector workloads
+  # ============================================================================
+  postgres-pgvector:
+    image: ankane/pgvector:latest
+    container_name: curioos-pgvector
+    environment:
+      - POSTGRES_USER=curioos
+      - POSTGRES_PASSWORD=curioos_password
+      - POSTGRES_DB=curioos_vectordb
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U curioos"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - curioos-network
+    profiles:
+      - pgvector
+
+  # ============================================================================
+  # Typesense - For full-text search to complement vector search
+  # ============================================================================
+  typesense:
+    image: typesense/typesense:latest
+    container_name: curioos-typesense
+    ports:
+      - "8108:8108"
+    volumes:
+      - ./data/typesense_data:/data
+    environment:
+      - TYPESENSE_DATA_DIR=/data
+      - TYPESENSE_API_KEY=curioos_typesense_key
+    command: "--data-dir /data --api-key curioos_typesense_key --enable-cors"
+    restart: unless-stopped
+    networks:
+      - curioos-network
+    profiles:
+      - typesense
+
+  # ============================================================================
+  # Redis with RediSearch - Alternative for hybrid search
+  # ============================================================================
+  redis-search:
+    image: redis/redis-stack:latest
+    container_name: curioos-redis
+    ports:
+      - "6379:6379"  # Redis
+      - "8001:8001"  # RedisInsight dashboard
+    volumes:
+      - ./data/redis_data:/data
+    environment:
+      - REDIS_ARGS=--save 60 1000
+    restart: unless-stopped
+    networks:
+      - curioos-network
+    profiles:
+      - redis
+
+networks:
+  curioos-network:
+    driver: bridge
+
+# ============================================================================
+# Usage Instructions
+# ============================================================================
+#
+# Start specific services:
+# -----------------------
+#
+# 1. Qdrant only (recommended for most use cases):
+#    docker-compose -f docker-compose.vectordb.yml up -d qdrant
+#
+# 2. Weaviate for hybrid search:
+#    docker-compose -f docker-compose.vectordb.yml up -d weaviate
+#
+# 3. PostgreSQL with pgvector:
+#    docker-compose -f docker-compose.vectordb.yml --profile pgvector up -d
+#
+# 4. Milvus (full stack):
+#    docker-compose -f docker-compose.vectordb.yml --profile milvus up -d
+#
+# 5. Multiple databases for comparison:
+#    docker-compose -f docker-compose.vectordb.yml up -d qdrant weaviate
+#
+#
+# Access Web UIs:
+# --------------
+# - Qdrant: http://localhost:6333/dashboard
+# - Weaviate: http://localhost:8080/v1/meta
+# - RedisInsight: http://localhost:8001
+# - MinIO (Milvus): http://localhost:9001 (minioadmin/minioadmin)
+#
+#
+# Stop and remove:
+# ---------------
+# docker-compose -f docker-compose.vectordb.yml down
+#
+# Stop and remove with data:
+# docker-compose -f docker-compose.vectordb.yml down -v
+#
+#
+# View logs:
+# ---------
+# docker-compose -f docker-compose.vectordb.yml logs -f qdrant
+#
+# ============================================================================
