@@ -21,7 +21,7 @@ Architecture Overview:
 	       │    └─────────────────┘
 	       │
 	       ├───►┌──────────────────┐
-	       │    │ index/vector_store│ Store & Search
+	       │    │ index/chroma_store│ Store & Search (ChromaDB)
 	       │    └──────────────────┘
 	       │
 	       ├───►┌─────────────────┐
@@ -70,7 +70,7 @@ from .ingest.parser import load_and_normalize
 from .ingest.chunker import chunk_text
 from .ingest.watcher import VaultWatcher
 from .index.embeddings import Embedder
-from .index.vector_store import VectorStore
+from .index.chroma_store import ChromaVectorStore
 from .llm.groq_client import GroqClient
 from .rag.graph import build_graph
 from .rag.prompts import build_messages
@@ -80,7 +80,7 @@ from .rag.prompts import build_messages
 log = py_logging.getLogger("curioos.app")
 
 
-def _index_file(path: Path, store: VectorStore, embedder: Embedder) -> None:
+def _index_file(path: Path, store: ChromaVectorStore, embedder: Embedder) -> None:
 	"""
 	Index a single document file into the vector store.
 
@@ -131,7 +131,7 @@ def _index_file(path: Path, store: VectorStore, embedder: Embedder) -> None:
 	log.info("Indexed %s with %d chunks", path, len(chunks))
 
 
-def _reindex_all(vault_dir: Path, store: VectorStore, embedder: Embedder) -> None:
+def _reindex_all(vault_dir: Path, store: ChromaVectorStore, embedder: Embedder) -> None:
 	"""
 	Rebuild the entire vector index from scratch.
 
@@ -165,7 +165,7 @@ def _reindex_all(vault_dir: Path, store: VectorStore, embedder: Embedder) -> Non
 	log.info("Reindexed %d files", count)
 
 
-def _on_change(path: Path, kind: str, store: VectorStore, embedder: Embedder) -> None:
+def _on_change(path: Path, kind: str, store: ChromaVectorStore, embedder: Embedder) -> None:
 	"""
 	Handle file system change events from VaultWatcher.
 
@@ -241,7 +241,7 @@ def main() -> None:
 
 	# Vector Store: Stores embeddings and provides similarity search
 	# Loads existing index from disk if available
-	store = VectorStore(cfg.index_dir, embedder.model_name)
+	store = ChromaVectorStore(cfg.index_dir, embedder.model_name)
 	store.ensure_manifest()
 
 	# Step 4: Parse command-line arguments

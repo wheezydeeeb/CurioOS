@@ -68,8 +68,8 @@ class GroqClient:
 		self.model = model
 
 		# Create LangChain ChatGroq instance only if we have an API key
-		# ChatGroq automatically reads GROQ_API_KEY from environment
-		self.llm = ChatGroq(model=self.model) if api_key else None
+		# Pass api_key explicitly to ChatGroq (it also reads from GROQ_API_KEY env var)
+		self.llm = ChatGroq(model=self.model, groq_api_key=api_key) if api_key else None
 
 	def generate(self, messages: List[dict], temperature: float = 0.2, max_tokens: int = 600) -> str:
 		"""

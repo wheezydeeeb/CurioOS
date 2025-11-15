@@ -33,26 +33,25 @@ Typical Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
 from langgraph.graph import END, StateGraph  # type: ignore
+from pydantic import BaseModel
 
-from ..index.vector_store import VectorStore, IndexEntry
+from ..index.chroma_store import ChromaVectorStore, IndexEntry
 from ..index.embeddings import Embedder
 from ..llm.groq_client import GroqClient
 from .prompts import build_messages
 
 
-@dataclass
-class RagState:
+class RagState(BaseModel):
 	"""
 	State container for RAG pipeline (currently unused, kept for future extensions).
 
-	LangGraph can use dataclasses for type-safe state, but we use plain dicts
-	for simplicity. This dataclass documents the expected state structure.
+	LangGraph can use Pydantic models for type-safe state, but we use plain dicts
+	for simplicity. This model documents the expected state structure.
 
 	Attributes:
 		question: User's question string
@@ -96,7 +95,7 @@ def _line_range_for_text(full_text: str, start: int, end: int) -> Tuple[int, int
 	return start_line, end_line
 
 
-def build_graph(store: VectorStore, embedder: Embedder, groq: GroqClient):
+def build_graph(store: ChromaVectorStore, embedder: Embedder, groq: GroqClient):
 	"""
 	Build and compile the RAG pipeline as a LangGraph StateGraph.
 
