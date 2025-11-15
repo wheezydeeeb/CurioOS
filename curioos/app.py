@@ -270,8 +270,8 @@ def main() -> None:
 		Ask a question and get an answer using the RAG pipeline.
 
 		This helper function wraps graph invocation for convenience.
-		It initializes the state with the question and top_k, runs
-		the pipeline, and extracts the answer.
+		It initializes the state with the question, runs the pipeline,
+		and extracts the answer.
 
 		Args:
 			question: User's question string
@@ -281,9 +281,14 @@ def main() -> None:
 
 		Pipeline Flow:
 			question → embed → retrieve → refine → generate → answer
+
+		Note:
+			The top_k parameter is configured at graph build time,
+			not passed in the state.
 		"""
-		# Initialize state with question and default top_k
-		state = {"question": question, "top_k": 5}
+		# Initialize state with question only
+		# LangGraph will convert dict to RagState
+		state = {"question": question}
 
 		# Run the RAG graph (ensure_index → retrieve → maybe_refine → generate)
 		result = graph.invoke(state)

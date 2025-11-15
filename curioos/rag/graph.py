@@ -26,19 +26,20 @@ Design Rationale:
 	- Debugging/observability (state snapshots at each step)
 
 Typical Usage:
-	>>> graph = build_graph(vector_store, embedder, groq_client)
-	>>> result = graph.invoke({"question": "What is CurioOS?", "top_k": 5})
+	>>> graph = build_graph(vector_store, embedder, groq_client, initial_top_k=5)
+	>>> result = graph.invoke({"question": "What is CurioOS?"})
 	>>> print(result["answer"])
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from langgraph.graph import END, StateGraph  # type: ignore
-from pydantic import BaseModel
+from langchain_core.messages import BaseMessage  # type: ignore
+from pydantic import BaseModel, Field
 
 from ..index.chroma_store import ChromaVectorStore, IndexEntry
 from ..index.embeddings import Embedder
@@ -48,19 +49,21 @@ from .prompts import build_messages
 
 class RagState(BaseModel):
 	"""
-	State container for RAG pipeline (currently unused, kept for future extensions).
+	Type-safe state container for RAG pipeline.
 
-	LangGraph can use Pydantic models for type-safe state, but we use plain dicts
-	for simplicity. This model documents the expected state structure.
+	LangGraph uses this Pydantic model for type-safe state management throughout
+	the pipeline. Fields are progressively populated as the graph executes.
 
 	Attributes:
-		question: User's question string
+		question: User's question string (required input)
 		contexts: Retrieved context chunks as (file_path, text, start_line, end_line, score) tuples
-		answer: Generated answer from LLM
+		          Populated by retrieve node
+		answer: Generated answer from LLM (final output)
+		        Populated by generate node
 	"""
 	question: str
-	contexts: List[Tuple[str, str, int, int, float]]
-	answer: str
+	contexts: Optional[List[Tuple[str, str, int, int, float]]] = Field(default=None)
+	answer: Optional[str] = Field(default=None)
 
 
 def _line_range_for_text(full_text: str, start: int, end: int) -> Tuple[int, int]:
@@ -95,7 +98,15 @@ def _line_range_for_text(full_text: str, start: int, end: int) -> Tuple[int, int
 	return start_line, end_line
 
 
-def build_graph(store: ChromaVectorStore, embedder: Embedder, groq: GroqClient):
+def build_graph(
+	store: ChromaVectorStore,
+	embedder: Embedder,
+	groq: GroqClient,
+	initial_top_k: int = 5,
+	low_score_threshold: float = 0.35,
+	refinement_increase: int = 3,
+	max_top_k: int = 10,
+):
 	"""
 	Build and compile the RAG pipeline as a LangGraph StateGraph.
 
@@ -107,6 +118,10 @@ def build_graph(store: ChromaVectorStore, embedder: Embedder, groq: GroqClient):
 		store: Vector store for similarity search
 		embedder: Embedding model for query encoding
 		groq: LLM client for answer generation
+		initial_top_k: Initial number of chunks to retrieve (default: 5)
+		low_score_threshold: Similarity threshold below which to expand search (default: 0.35)
+		refinement_increase: Number of additional chunks to retrieve on refinement (default: 3)
+		max_top_k: Maximum number of chunks to retrieve after refinement (default: 10)
 
 	Returns:
 		Compiled StateGraph ready for invocation
@@ -114,27 +129,26 @@ def build_graph(store: ChromaVectorStore, embedder: Embedder, groq: GroqClient):
 	Graph Structure:
 		ensure_index → retrieve → maybe_refine → generate → END
 
-	State Dictionary:
+	State:
 		Input:
 			- question: str (user's question)
-			- top_k: int (number of chunks to retrieve, default 5)
 		Output:
 			- contexts: List[Tuple[str, str, int, int, float]] (retrieved chunks)
 			- answer: str (LLM-generated response)
 
 	Example:
-		>>> graph = build_graph(store, embedder, groq)
-		>>> result = graph.invoke({"question": "What is Python?", "top_k": 5})
+		>>> graph = build_graph(store, embedder, groq, initial_top_k=5)
+		>>> result = graph.invoke({"question": "What is Python?"})
 		>>> print(result["answer"])
 		Python is a programming language [1]...
 
 		Sources:
 		[1] python_intro.md:1-5
 	"""
-	# Create StateGraph with dict state (flexible, untyped)
-	graph = StateGraph(dict)
+	# Create StateGraph with Pydantic RagState (type-safe)
+	graph = StateGraph(RagState)
 
-	def ensure_index(state: Dict[str, Any]) -> Dict[str, Any]:
+	def ensure_index(state: RagState) -> Dict[str, Any]:
 		"""
 		Validate that vector index exists and is initialized.
 
@@ -143,18 +157,21 @@ def build_graph(store: ChromaVectorStore, embedder: Embedder, groq: GroqClient):
 		manifest file if missing.
 
 		Args:
-			state: Current state dictionary
+			state: Current RAG state
 
 		Returns:
-			Unmodified state (no changes)
+			Empty dict (no state updates)
 
 		Side Effects:
 			May create manifest.json if it doesn't exist
 		"""
 		store.ensure_manifest()
-		return state
+		return {}
 
-	def retrieve(state: Dict[str, Any]) -> Dict[str, Any]:
+	# Track current top_k value (starts at initial_top_k, may be increased by maybe_refine)
+	current_top_k = initial_top_k
+
+	def retrieve(state: RagState) -> Dict[str, Any]:
 		"""
 		Retrieve relevant document chunks using vector similarity search.
 
@@ -163,13 +180,13 @@ def build_graph(store: ChromaVectorStore, embedder: Embedder, groq: GroqClient):
 		2. Encodes it into an embedding vector
 		3. Searches the vector store for top-k similar chunks
 		4. Formats results with line numbers (approximation)
-		5. Adds contexts to state
+		5. Returns contexts update
 
 		Args:
-			state: State dict with "question" and optional "top_k"
+			state: RAG state with question field
 
 		Returns:
-			State dict with added "contexts" field
+			Dict with "contexts" field to update state
 
 		Context Format:
 			List of (file_path, text, start_line, end_line, similarity_score) tuples
@@ -183,14 +200,15 @@ def build_graph(store: ChromaVectorStore, embedder: Embedder, groq: GroqClient):
 			Line numbers are approximate because we only store chunk text,
 			not the full document. We assume each chunk starts at line 1.
 		"""
-		question = state["question"]
+		question = state.question
 
 		# Encode the question into an embedding vector
 		q_emb = embedder.encode_query(question)
 
 		# Search vector store for top-k most similar chunks
-		# top_k can be adjusted by maybe_refine node
-		results = store.search(q_emb, top_k=state.get("top_k", 5))
+		# Use nonlocal current_top_k which may be adjusted by maybe_refine
+		nonlocal current_top_k
+		results = store.search(q_emb, top_k=current_top_k)
 
 		# Format results as (file_path, text, start_line, end_line, score) tuples
 		contexts: List[Tuple[str, str, int, int, float]] = []
@@ -203,26 +221,25 @@ def build_graph(store: ChromaVectorStore, embedder: Embedder, groq: GroqClient):
 
 			contexts.append((entry.file_path, entry.text, start_line, end_line, score))
 
-		# Add contexts to state
-		state["contexts"] = contexts
-		return state
+		# Return dict to update state
+		return {"contexts": contexts}
 
-	def maybe_refine(state: Dict[str, Any]) -> Dict[str, Any]:
+	def maybe_refine(state: RagState) -> Dict[str, Any]:
 		"""
 		Expand retrieval if initial results have low similarity scores.
 
 		This adaptive retrieval node checks if the best result has a low
-		similarity score (< 0.35), indicating the query may not have good
-		matches. If so, it increases top_k and re-runs retrieval.
+		similarity score, indicating the query may not have good matches.
+		If so, it increases top_k and re-runs retrieval.
 
 		Args:
-			state: State dict with "contexts" from retrieve node
+			state: RAG state with contexts from retrieve node
 
 		Returns:
-			State dict, possibly with updated "contexts" if re-retrieval occurred
+			Dict with updated "contexts" field if re-retrieval occurred, empty dict otherwise
 
 		Adaptive Logic:
-			- If max(similarity_scores) < 0.35 → increase top_k by 3, re-retrieve
+			- If max(similarity_scores) < low_score_threshold → increase top_k, re-retrieve
 			- Otherwise → pass through unchanged
 
 		Rationale:
@@ -232,25 +249,26 @@ def build_graph(store: ChromaVectorStore, embedder: Embedder, groq: GroqClient):
 
 		Example:
 			Initial retrieval: top_k=5, max_score=0.28 (low!)
-			→ Increase to top_k=10, re-retrieve
+			→ Increase to top_k=8, re-retrieve
 			→ New max_score=0.41 (better)
-			→ Continue to generation with 10 chunks
+			→ Continue to generation with 8 chunks
 		"""
 		# Get current contexts from previous retrieve call
-		contexts: List[Tuple[str, str, int, int, float]] = state.get("contexts", [])
+		contexts = state.contexts or []
 
 		# Check if we have low-quality results
-		# If no contexts or all scores < 0.35, expand search
-		if not contexts or max(c[-1] for c in contexts) < 0.35:
-			# Increase top_k (cap at 10 to avoid overwhelming the LLM)
-			state["top_k"] = min(10, state.get("top_k", 5) + 3)
+		# If no contexts or all scores < threshold, expand search
+		if not contexts or max(c[-1] for c in contexts) < low_score_threshold:
+			# Increase top_k (cap at max_top_k to avoid overwhelming the LLM)
+			nonlocal current_top_k
+			current_top_k = min(max_top_k, current_top_k + refinement_increase)
 			# Re-run retrieval with expanded top_k
 			return retrieve(state)
 
 		# Results are good enough, continue with current contexts
-		return state
+		return {}
 
-	def generate(state: Dict[str, Any]) -> Dict[str, Any]:
+	def generate(state: RagState) -> Dict[str, Any]:
 		"""
 		Generate answer using LLM with retrieved context.
 
@@ -258,57 +276,53 @@ def build_graph(store: ChromaVectorStore, embedder: Embedder, groq: GroqClient):
 		1. Extracts question and contexts from state
 		2. Formats them into LLM messages (via prompts.py)
 		3. Calls Groq LLM to generate answer
-		4. Adds answer to state
+		4. Returns answer update
 
 		Args:
-			state: State dict with "question" and "contexts"
+			state: RAG state with question and contexts fields
 
 		Returns:
-			State dict with added "answer" field
+			Dict with "answer" field to update state
 
 		LLM Interaction:
-			Messages = [system prompt, user message with context + question]
+			Messages = [SystemMessage, HumanMessage with context + question]
 			System prompt enforces: citation discipline, conciseness, "I don't know"
 			Response should include inline citations [1], [2] and source list at end
 
 		Example Flow:
-			Input state: {"question": "What is CurioOS?", "contexts": [...]}
+			Input state: RagState(question="What is CurioOS?", contexts=[...])
 			↓
 			Build messages: [
-				{"role": "system", "content": "You are CurioOS. Answer concisely..."},
-				{"role": "user", "content": "Context:\\n[1] file.txt...\\n\\nQuestion: What is CurioOS?"}
+				SystemMessage(content="You are CurioOS. Answer concisely..."),
+				HumanMessage(content="Context:\\n[1] file.txt...\\n\\nQuestion: What is CurioOS?")
 			]
 			↓
 			Call groq.generate(messages)
 			↓
-			Output state: {"question": ..., "contexts": ..., "answer": "CurioOS is..."}
+			Output: {"answer": "CurioOS is..."}
 		"""
-		question = state["question"]
-		contexts: List[Tuple[str, str, int, int, float]] = state.get("contexts", [])
+		question = state.question
+		contexts = state.contexts or []
 
 		# Build LLM messages with system prompt and formatted context
+		# Returns list of LangChain message objects
 		messages = build_messages(question, contexts)
 
 		# Generate answer using Groq LLM
 		answer = groq.generate(messages)
 
-		# Add answer to state
-		state["answer"] = answer
-		return state
+		# Return dict to update state
+		return {"answer": answer}
 
-	# Register all nodes in the graph
 	graph.add_node("ensure_index", ensure_index)
 	graph.add_node("retrieve", retrieve)
 	graph.add_node("maybe_refine", maybe_refine)
 	graph.add_node("generate", generate)
 
-	# Define execution flow: ensure_index → retrieve → maybe_refine → generate → END
 	graph.set_entry_point("ensure_index")
 	graph.add_edge("ensure_index", "retrieve")
 	graph.add_edge("retrieve", "maybe_refine")
 	graph.add_edge("maybe_refine", "generate")
 	graph.add_edge("generate", END)
 
-	# Compile the graph into a runnable
-	# This validates the graph structure and prepares it for execution
 	return graph.compile()

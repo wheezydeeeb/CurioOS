@@ -30,6 +30,8 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
+from langchain_core.messages import SystemMessage, HumanMessage  # type: ignore
+
 
 # System prompt that defines CurioOS's personality and constraints
 # This is sent with EVERY request to set behavioral expectations
@@ -98,27 +100,27 @@ def format_context(contexts: List[Tuple[str, str, int, int, float]]) -> str:
 	return "\n\n---\n\n".join(parts)
 
 
-def build_messages(question: str, contexts: List[Tuple[str, str, int, int, float]]) -> list:
+def build_messages(question: str, contexts: List[Tuple[str, str, int, int, float]]) -> List[SystemMessage | HumanMessage]:
 	"""
 	Build the complete message list for LLM generation.
 
 	This function assembles a two-message conversation:
 	1. System message: Defines CurioOS's behavior and constraints
-	2. User message: Contains formatted context + user's question
+	2. Human message: Contains formatted context + user's question
 
 	Args:
 		question: User's question (e.g., "What is CurioOS?")
 		contexts: Retrieved context chunks from vector search
 
 	Returns:
-		List of message dicts ready for GroqClient.generate()
-		Format: [{"role": "system", "content": ...}, {"role": "user", "content": ...}]
+		List of LangChain message objects ready for GroqClient.generate()
+		Format: [SystemMessage(...), HumanMessage(...)]
 
 	Message Structure:
-		System message:
+		SystemMessage:
 			"You are CurioOS. Answer concisely using only the provided context..."
 
-		User message:
+		HumanMessage:
 			"Context:
 			[1] file1.txt:5-10 (score=0.87)
 			<chunk text>
@@ -133,8 +135,8 @@ def build_messages(question: str, contexts: List[Tuple[str, str, int, int, float
 		>>> messages = build_messages("What is CurioOS?", contexts)
 		>>> print(messages)
 		[
-		  {"role": "system", "content": "You are CurioOS. Answer concisely..."},
-		  {"role": "user", "content": "Context:\\n[1] doc.txt:1-1 (score=0.90)\\nCurioOS is awesome\\n\\nQuestion: What is CurioOS?"}
+		  SystemMessage(content="You are CurioOS. Answer concisely..."),
+		  HumanMessage(content="Context:\\n[1] doc.txt:1-1 (score=0.90)\\nCurioOS is awesome\\n\\nQuestion: What is CurioOS?")
 		]
 
 	Design Rationale:
@@ -142,16 +144,17 @@ def build_messages(question: str, contexts: List[Tuple[str, str, int, int, float
 		- Context placed before question (LLM sees evidence before forming answer)
 		- Clear separation between context and question
 		- "No context available" fallback prevents errors if search returns nothing
+		- Using LangChain message types provides better type safety and integration
 	"""
 	# Format context chunks, or use placeholder if no results
 	context_str = format_context(contexts) if contexts else "No context available."
 
 	# Build user message with context first, then question
 	# This ordering helps the LLM ground its answer in the context
-	user = f"Context:\n{context_str}\n\nQuestion: {question}"
+	user_content = f"Context:\n{context_str}\n\nQuestion: {question}"
 
-	# Return standard message list: [system, user]
+	# Return standard message list using LangChain message types
 	return [
-		{"role": "system", "content": SYSTEM_PROMPT},
-		{"role": "user", "content": user},
+		SystemMessage(content=SYSTEM_PROMPT),
+		HumanMessage(content=user_content),
 	]
