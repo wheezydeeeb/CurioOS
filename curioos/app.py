@@ -60,6 +60,7 @@ Typical Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging as py_logging
 from pathlib import Path
 from typing import List, Tuple
@@ -248,6 +249,7 @@ def main() -> None:
 	parser = argparse.ArgumentParser(description="CurioOS")
 	parser.add_argument("--index", action="store_true", help="Rebuild index for the vault directory")
 	parser.add_argument("--ask", type=str, help="Ask a question via CLI and print the answer")
+	parser.add_argument("--stream", action="store_true", help="Enable streaming mode for real-time feedback")
 	args = parser.parse_args()
 
 	# Step 5: Handle --index mode (rebuild index and exit)
@@ -262,10 +264,11 @@ def main() -> None:
 	# Groq LLM client
 	groq = GroqClient(cfg.groq_api_key, cfg.groq_model)
 
-	# RAG pipeline (LangGraph)
-	graph = build_graph(store, embedder, groq)
+	# RAG pipeline (LangGraph) with checkpointing enabled
+	checkpoint_path = str(cfg.index_dir / "checkpoints.db")
+	graph = build_graph(store, embedder, groq, checkpoint_path=checkpoint_path)
 
-	def ask(question: str) -> str:
+	def ask(question: str, thread_id: str = "default") -> str:
 		"""
 		Ask a question and get an answer using the RAG pipeline.
 
@@ -275,6 +278,7 @@ def main() -> None:
 
 		Args:
 			question: User's question string
+			thread_id: Thread identifier for conversation tracking (default: "default")
 
 		Returns:
 			LLM-generated answer with citations
@@ -290,15 +294,118 @@ def main() -> None:
 		# LangGraph will convert dict to RagState
 		state = {"question": question}
 
+		# Configure with thread_id for checkpointing and conversation tracking
+		config = {"configurable": {"thread_id": thread_id}}
+
 		# Run the RAG graph (ensure_index → retrieve → maybe_refine → generate)
-		result = graph.invoke(state)
+		result = graph.invoke(state, config=config)
 
 		# Extract answer from final state
 		return result.get("answer", "(no answer)")
 
+	def ask_streaming(question: str, thread_id: str = "default", show_steps: bool = True):
+		"""
+		Ask a question with streaming for real-time feedback.
+
+		This function streams state updates as the pipeline progresses,
+		providing visibility into each step.
+
+		Args:
+			question: User's question string
+			thread_id: Thread identifier for conversation tracking
+			show_steps: Whether to print intermediate step information
+
+		Yields:
+			State dictionaries as the graph executes
+
+		Pipeline Flow (with streaming):
+			question → [ensure_index] → [retrieve] → [maybe_refine] → [generate] → answer
+
+		Example:
+			>>> for chunk in ask_streaming("What is CurioOS?"):
+			...     if "answer" in chunk:
+			...         print(chunk["answer"])
+		"""
+		state = {"question": question}
+		config = {"configurable": {"thread_id": thread_id}}
+
+		# Stream with "values" mode to get full state after each node
+		for chunk in graph.stream(state, config=config, stream_mode="values"):
+			# Show intermediate progress if requested
+			if show_steps:
+				if "contexts" in chunk and chunk.get("contexts") and not chunk.get("answer"):
+					num_contexts = len(chunk["contexts"])
+					print(f"\rRetrieved {num_contexts} context chunks", end="", flush=True)
+
+			yield chunk
+
+		# Clear progress indicators
+		if show_steps:
+			print("\r" + " " * 50 + "\r", end="", flush=True)
+
+	async def aask(question: str, thread_id: str = "default") -> str:
+		"""
+		Async version of ask() for concurrent query processing.
+
+		This function allows multiple questions to be processed concurrently,
+		improving throughput when handling multiple queries.
+
+		Args:
+			question: User's question string
+			thread_id: Thread identifier for conversation tracking
+
+		Returns:
+			LLM-generated answer with citations
+
+		Example:
+			>>> async def process_questions(questions):
+			...     tasks = [aask(q) for q in questions]
+			...     answers = await asyncio.gather(*tasks)
+			...     return answers
+		"""
+		state = {"question": question}
+		config = {"configurable": {"thread_id": thread_id}}
+
+		# Use async invoke for non-blocking execution
+		result = await graph.ainvoke(state, config=config)
+
+		return result.get("answer", "(no answer)")
+
+	async def aask_streaming(question: str, thread_id: str = "default", show_steps: bool = True):
+		"""
+		Async streaming version for concurrent query processing with real-time feedback.
+
+		Args:
+			question: User's question string
+			thread_id: Thread identifier for conversation tracking
+			show_steps: Whether to print intermediate step information
+
+		Yields:
+			State dictionaries as the graph executes
+		"""
+		state = {"question": question}
+		config = {"configurable": {"thread_id": thread_id}}
+
+		# Stream asynchronously for non-blocking execution
+		async for chunk in graph.astream(state, config=config, stream_mode="values"):
+			if show_steps:
+				if "contexts" in chunk and chunk.get("contexts") and not chunk.get("answer"):
+					num_contexts = len(chunk["contexts"])
+					print(f"\rRetrieved {num_contexts} context chunks", end="", flush=True)
+
+			yield chunk
+
+		if show_steps:
+			print("\r" + " " * 50 + "\r", end="", flush=True)
+
 	# Step 7: Handle --ask mode (single question via CLI)
 	if args.ask:
-		print(ask(args.ask))
+		if args.stream:
+			for chunk in ask_streaming(args.ask):
+				if "answer" in chunk and chunk.get("answer"):
+					print(chunk["answer"])
+		else:
+			print(ask(args.ask))
 		return
 
 	# Step 8: Interactive mode (terminal Q&A loop with file watching)
@@ -314,6 +421,7 @@ def main() -> None:
 	print(f"\n{'='*60}")
 	print(f"CurioOS Terminal - Model: {cfg.groq_model}")
 	print(f"Vault: {cfg.vault_dir}")
+	print(f"Mode: {'Streaming' if args.stream else 'Standard'}")
 	print(f"{'='*60}\n")
 
 	# Main interaction loop
@@ -335,26 +443,32 @@ def main() -> None:
 				# Show "thinking" indicator while processing
 				print("\nThinking...", end='', flush=True)
 
-				# Run RAG pipeline
-				answer = ask(question)
+				# Run RAG pipeline with streaming or standard mode
+				if args.stream:
+					# Streaming mode - shows progress and answer as it generates
+					answer = None
+					for chunk in ask_streaming(question):
+						if "answer" in chunk and chunk.get("answer"):
+							answer = chunk["answer"]
 
-				# Clear "Thinking..." message
-				print("\r" + " " * 15 + "\r", end='')
-
-				# Display answer
-				print(f"\nAnswer:\n{answer}\n")
+					if answer:
+						print(f"\nAnswer:\n{answer}\n")
+					else:
+						print("\r" + " " * 15 + "\r", end='')
+						print("\nNo answer generated.\n")
+				else:
+					answer = ask(question)
+					print("\r" + " " * 15 + "\r", end='')
+					print(f"\nAnswer:\n{answer}\n")
 
 			except KeyboardInterrupt:
-				# Handle Ctrl+C gracefully during input
 				print("\n\nUse 'exit' to quit.")
 				continue
 
 	finally:
-		# Cleanup: stop file watcher
 		watcher.stop()
 		log.info("CurioOS stopped")
 
 
 if __name__ == "__main__":
-	# Entry point when running as a module: python -m curioos.app
 	main()

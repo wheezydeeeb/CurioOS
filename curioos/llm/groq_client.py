@@ -35,6 +35,7 @@ Typical Usage:
 from __future__ import annotations
 
 from typing import List
+import asyncio
 
 from langchain_groq import ChatGroq  # type: ignore
 from langchain_core.messages import AnyMessage  # type: ignore
@@ -124,4 +125,38 @@ class GroqClient:
 
 		# Extract content from response
 		# getattr with fallback ensures we always return a string
+		return getattr(resp, "content", str(resp)) or ""
+
+	async def agenerate(self, messages: List[AnyMessage], temperature: float = 0.2, max_tokens: int = 600) -> str:
+		"""
+		Async version of generate() for concurrent LLM calls.
+
+		This method allows multiple LLM generations to run concurrently,
+		improving throughput when processing multiple queries.
+
+		Args:
+			messages: List of LangChain message objects
+			temperature: Sampling temperature (0.0 = deterministic, 2.0 = very random)
+			max_tokens: Maximum number of tokens to generate
+
+		Returns:
+			Generated text as string
+
+		Example:
+			>>> async def process_questions(questions):
+			...     tasks = [client.agenerate([HumanMessage(content=q)]) for q in questions]
+			...     answers = await asyncio.gather(*tasks)
+			...     return answers
+		"""
+		# Check if API key is configured
+		if not self.llm:
+			return "Groq API key not configured. Please set GROQ_API_KEY in your .env."
+
+		# Bind generation parameters to the LLM
+		runnable = self.llm.bind(temperature=temperature, max_tokens=max_tokens)
+
+		# Async invoke the LLM with the messages
+		resp = await runnable.ainvoke(messages)
+
+		# Extract content from response
 		return getattr(resp, "content", str(resp)) or ""

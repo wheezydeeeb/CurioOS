@@ -33,11 +33,15 @@ Typical Usage:
 
 from __future__ import annotations
 
+import logging
+import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from langgraph.graph import END, StateGraph  # type: ignore
+from langgraph.types import RetryPolicy  # type: ignore
+from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore
 from langchain_core.messages import BaseMessage  # type: ignore
 from pydantic import BaseModel, Field
 
@@ -45,6 +49,10 @@ from ..index.chroma_store import ChromaVectorStore, IndexEntry
 from ..index.embeddings import Embedder
 from ..llm.groq_client import GroqClient
 from .prompts import build_messages
+
+
+# Module-level logger
+log = logging.getLogger("curioos.rag.graph")
 
 
 class RagState(BaseModel):
@@ -106,6 +114,7 @@ def build_graph(
 	low_score_threshold: float = 0.35,
 	refinement_increase: int = 3,
 	max_top_k: int = 10,
+	checkpoint_path: Optional[str] = None,
 ):
 	"""
 	Build and compile the RAG pipeline as a LangGraph StateGraph.
@@ -122,6 +131,8 @@ def build_graph(
 		low_score_threshold: Similarity threshold below which to expand search (default: 0.35)
 		refinement_increase: Number of additional chunks to retrieve on refinement (default: 3)
 		max_top_k: Maximum number of chunks to retrieve after refinement (default: 10)
+		checkpoint_path: Optional path to SQLite database for checkpointing (default: None)
+		                 Enables fault tolerance, memory, and state persistence
 
 	Returns:
 		Compiled StateGraph ready for invocation
@@ -202,27 +213,33 @@ def build_graph(
 		"""
 		question = state.question
 
-		# Encode the question into an embedding vector
-		q_emb = embedder.encode_query(question)
+		try:
+			# Encode the question into an embedding vector
+			q_emb = embedder.encode_query(question)
 
-		# Search vector store for top-k most similar chunks
-		# Use nonlocal current_top_k which may be adjusted by maybe_refine
-		nonlocal current_top_k
-		results = store.search(q_emb, top_k=current_top_k)
+			# Search vector store for top-k most similar chunks
+			# Use nonlocal current_top_k which may be adjusted by maybe_refine
+			nonlocal current_top_k
+			results = store.search(q_emb, top_k=current_top_k)
 
-		# Format results as (file_path, text, start_line, end_line, score) tuples
-		contexts: List[Tuple[str, str, int, int, float]] = []
-		for entry, score in results:
-			# Note: entry.text is already the chunk text (we don't store full docs)
-			# Line numbers are approximate - we count newlines within the chunk
-			full_text = entry.text
-			start_line = 1  # Chunks start at line 1 (relative to chunk, not document)
-			end_line = full_text.count("\n") + 1
+			# Format results as (file_path, text, start_line, end_line, score) tuples
+			contexts: List[Tuple[str, str, int, int, float]] = []
+			for entry, score in results:
+				# Note: entry.text is already the chunk text (we don't store full docs)
+				# Line numbers are approximate - we count newlines within the chunk
+				full_text = entry.text
+				start_line = 1  # Chunks start at line 1 (relative to chunk, not document)
+				end_line = full_text.count("\n") + 1
 
-			contexts.append((entry.file_path, entry.text, start_line, end_line, score))
+				contexts.append((entry.file_path, entry.text, start_line, end_line, score))
 
-		# Return dict to update state
-		return {"contexts": contexts}
+			# Return dict to update state
+			return {"contexts": contexts}
+
+		except Exception as e:
+			# Log error and return empty contexts
+			log.error(f"Error during retrieval: {e}", exc_info=True)
+			return {"contexts": []}
 
 	def maybe_refine(state: RagState) -> Dict[str, Any]:
 		"""
@@ -304,20 +321,63 @@ def build_graph(
 		question = state.question
 		contexts = state.contexts or []
 
-		# Build LLM messages with system prompt and formatted context
-		# Returns list of LangChain message objects
-		messages = build_messages(question, contexts)
+		try:
+			# Build LLM messages with system prompt and formatted context
+			# Returns list of LangChain message objects
+			messages = build_messages(question, contexts)
 
-		# Generate answer using Groq LLM
-		answer = groq.generate(messages)
+			# Generate answer using Groq LLM
+			answer = groq.generate(messages)
 
-		# Return dict to update state
-		return {"answer": answer}
+			# Return dict to update state
+			return {"answer": answer}
 
+		except Exception as e:
+			# Log error and return fallback response with available context
+			log.error(f"Error during LLM generation: {e}", exc_info=True)
+
+			# Build fallback response showing retrieved documents
+			fallback = (
+				f"I encountered an error while generating the answer: {str(e)}\n\n"
+				"However, here are the relevant documents I found:\n"
+			)
+
+			# Add citations list as fallback
+			for i, (file_path, text, _, _, score) in enumerate(contexts, 1):
+				# Truncate text to first 150 chars for preview
+				preview = text[:150] + "..." if len(text) > 150 else text
+				fallback += f"\n[{i}] {Path(file_path).name} (score: {score:.2f})\n{preview}\n"
+
+			return {"answer": fallback if contexts else "An error occurred and no context was retrieved."}
+
+	# Add nodes with appropriate retry policies
 	graph.add_node("ensure_index", ensure_index)
-	graph.add_node("retrieve", retrieve)
+
+	# Retrieve node: Retry on transient vector store/embedding errors
+	graph.add_node(
+		"retrieve",
+		retrieve,
+		retry_policy=RetryPolicy(
+			max_attempts=3,
+			initial_interval=0.5,  # Start with 500ms delay
+			backoff_factor=2.0,    # Exponential backoff
+			max_interval=5.0,      # Cap at 5 seconds
+		)
+	)
+
 	graph.add_node("maybe_refine", maybe_refine)
-	graph.add_node("generate", generate)
+
+	# Generate node: Retry on Groq API rate limits and transient errors
+	graph.add_node(
+		"generate",
+		generate,
+		retry_policy=RetryPolicy(
+			max_attempts=3,
+			initial_interval=1.0,   # Start with 1 second delay
+			backoff_factor=2.0,     # Exponential backoff
+			max_interval=10.0,      # Cap at 10 seconds
+		)
+	)
 
 	graph.set_entry_point("ensure_index")
 	graph.add_edge("ensure_index", "retrieve")
@@ -325,4 +385,11 @@ def build_graph(
 	graph.add_edge("maybe_refine", "generate")
 	graph.add_edge("generate", END)
 
-	return graph.compile()
+	# Setup checkpointer if path provided
+	checkpointer = None
+	if checkpoint_path:
+		log.info(f"Initializing checkpointer at {checkpoint_path}")
+		conn = sqlite3.connect(checkpoint_path, check_same_thread=False)
+		checkpointer = SqliteSaver(conn)
+
+	return graph.compile(checkpointer=checkpointer)
